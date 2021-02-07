@@ -286,15 +286,69 @@ class RRTStarUnicycle:
 
         return p_new, True
 
-    def _closest_tree_pt(self, p):
-        min_dist = float('inf')
-        for tree_p in self.tree.keys():
-            euclid_dist = self._euclid_2D(p, tree_p)
-            if euclid_dist < min_dist:
-                closest_pt = p
-                min_dist = euclid_dist  
+    # def _closest_tree_pt(self, p):
+    #     min_dist = float('inf')
+    #     for tree_p in self.tree.keys():
+    #         euclid_dist = self._euclid_2D(p, tree_p)
+    #         if euclid_dist < min_dist:
+    #             closest_pt = p
+    #             min_dist = euclid_dist  
 
-        return closest_pt
+    #     return closest_pt
+
+    # def _closest_tree_pt(self, p):
+    #     return min(self.tree.keys(), lambda x: self._euclid_2D(p, x))
+
+    def _get_near_pts(self, pt):
+        ret = []
+        i = int((pt.x-self.x_min)//self._near_threshold)
+        j = int((pt.y-self.y_min)//self._near_threshold)
+        ret += self.grid_hash[(i,j)]
+        left = ((pt.x-self.x_min)%self._near_threshold) < self._near_threshold/2
+        down = ((pt.y-self.y_min)%self._near_threshold) < self._near_threshold/2
+        if left:
+            ret += self.grid_hash[(i-1,j)]
+            if down:
+                ret += self.grid_hash[(i-1,j-1)]
+                ret += self.grid_hash[(i,j-1)]
+            else:
+                ret += self.grid_hash[(i-1,j+1)]
+                ret += self.grid_hash[(i,j+1)]
+        else:
+            ret += self.grid_hash[(i+1,j)]
+            if down:
+                ret += self.grid_hash[(i+1,j-1)]
+                ret += self.grid_hash[(i,j-1)]
+            else:
+                ret += self.grid_hash[(i+1,j+1)]
+                ret += self.grid_hash[(i,j+1)]
+
+        return ret
+
+    def _closest_tree_pt(self, pt):
+        neighbors = []
+        i = int((pt.x-self.x_min)//self._near_threshold)
+        j = int((pt.y-self.y_min)//self._near_threshold)
+        count = 0
+        nearby_grids = [(i,j)]
+        while not neighbors:
+            if count > 0:
+                for c in range(-count+1,count):
+                    nearby_grids.append( (i+count, j+c) )     # Right grids
+                    nearby_grids.append( (i-count, j+c) )     # Left grids
+                    nearby_grids.append( (i+c,     j+count) ) # Upper grids
+                    nearby_grids.append( (i+c,     j-count) ) # Lower grids
+                # Corner grids
+                nearby_grids.append( (i+count, j+count) )
+                nearby_grids.append( (i+count, j-count) )
+                nearby_grids.append( (i-count, j+count) )
+                nearby_grids.append( (i-count, j-count) ) 
+            for ii, jj in nearby_grids:
+                neighbors += self.grid_hash[(ii,jj)]
+            count += 1
+            nearby_grids = []
+
+        return min(neighbors, key=lambda x: self._euclid_2D(pt, x))
 
     def _path_exists(self, a, b):
         # c = self._pathfinder.try_step_no_sliding(a.point, b.point)
@@ -419,10 +473,11 @@ class RRTStarUnicycle:
                 continue
             if v == start_str:
                 self.tree[pt] = self._start
-
+                self.add_to_grid_hash(pt)
             else:
                 pt_v = self._str_to_pt(v)
                 self.tree[pt] = pt_v
+                self.add_to_grid_hash(pt)
 
         
         self._start_iteration = int(os.path.basename(json_path).split('_')[0]) + 1
@@ -443,15 +498,8 @@ class RRTStarUnicycle:
             self._top_down_img = self._top_down_img[y:y+h,x:x+w]
             
             # Determine scaling needed
-            x_min, y_min = float('inf'), float('inf')
-            for v in self._pathfinder.build_navmesh_vertices():
-                pt = PointHeading(v)
-                # Make sure it's on the same elevation as the start point
-                if abs(pt.z-self._start.z) < 0.8:
-                    x_min = min(x_min, pt.x)
-                    y_min = min(y_min, pt.y)
-            self._scale_x = lambda x: int((x-x_min)/meters_per_pixel)
-            self._scale_y = lambda y: int((y-y_min)/meters_per_pixel)
+            self._scale_x = lambda x: int((x-self.x_min)/meters_per_pixel)
+            self._scale_y = lambda y: int((y-self.y_min)/meters_per_pixel)
 
         top_down_img = self._top_down_img.copy()
 
@@ -544,6 +592,11 @@ class RRTStarUnicycle:
 
         return string_tree
 
+    def add_to_grid_hash(self, pt):
+        i = int((pt.x-self.x_min)//self._near_threshold)
+        j = int((pt.y-self.y_min)//self._near_threshold)
+        self.grid_hash[(i,j)].append(pt)
+
     def generate_tree(
         self,
         start_position,
@@ -560,8 +613,23 @@ class RRTStarUnicycle:
         self._cost_from_parent[start_pt] = 0
         self._start = start_pt
         self._goal = goal_pt
-        self._load_tree_from_json(json_path=json_path)
+        self.grid_hash = defaultdict(list)
         # self.times = defaultdict(list)
+
+        self.x_min, self.y_min = float('inf'), float('inf')
+        self.x_max, self.y_max = float('-inf'), float('-inf')
+        for v in self._pathfinder.build_navmesh_vertices():
+            pt = PointHeading(v)
+            # Make sure it's on the same elevation as the start point
+            if abs(pt.z-self._start.z) < 0.8:
+                self.x_min = min(self.x_min, pt.x)
+                self.y_min = min(self.y_min, pt.y)
+                self.x_max = max(self.x_max, pt.x)
+                self.y_max = max(self.y_max, pt.y)
+                
+        self.add_to_grid_hash(self._start)
+        self._load_tree_from_json(json_path=json_path)
+
         for iteration in tqdm.trange(int(iterations+1)):
         # for iteration in range(int(iterations+1)):
             if iteration < self._start_iteration:
@@ -612,7 +680,8 @@ class RRTStarUnicycle:
 
                 # Find valid neighbors
                 nearby_nodes = []
-                for pt in self.tree.keys(): # TODO: Make this fast
+                # for pt in self.tree.keys(): # TODO: Make this fast
+                for pt in self._get_near_pts(rand_pt):
                     if (
                         self._euclid_2D(rand_pt, pt) < self._near_threshold # within distance
                         and (rand_pt.x, rand_pt.y) != (pt.x, pt.y) # not the same point again
@@ -644,6 +713,7 @@ class RRTStarUnicycle:
                 try:
                     self.tree[rand_pt] = nearby_nodes.pop(best_parent_idx)
                     self._cost_from_parent[rand_pt] = best_cost_from_parent
+                    self.add_to_grid_hash(rand_pt)
                 except IndexError:
                     continue
 
