@@ -355,7 +355,7 @@ class RRTStarUnicycle:
         # return np.allclose(b.point, c)
         try:
             intermediate_points = self.calculate_intermediate_points([a,b])
-        except ValueError:
+        except (ValueError, OverflowError):
             return False
 
         # for pt, next_pt in zip(intermediate_points[:-1], intermediate_points[1:]):
