@@ -22,9 +22,9 @@ parser.add_argument("--max_linear_velocity", type=float, default=0.25) # in m/s
 parser.add_argument("--max_angular_velocity", type=float, default=np.pi/180*10) # in rad/s
 parser.add_argument("--goal_minimum_distance", type=float, default=0.2) # in m
 parser.add_argument("--near_threshold", type=float, default=1.5) # in m
-parser.add_argument("--max_distance", type=float, default=0.5) # in m
+parser.add_argument("--max_distance", type=float, default=1.5) # in m
 parser.add_argument("--visualize_on_screen", action="store_true")
-parser.add_argument("--iterations", type=int, default=1e4)
+parser.add_argument("--iterations", type=int, default=5e3)
 parser.add_argument("--visualize_iterations", type=int, default=500)
 
 # parser.add_argument("--scene", type=str, default=dr.default_sim_settings["scene"])

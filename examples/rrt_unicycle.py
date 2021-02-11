@@ -75,6 +75,9 @@ class PointHeading:
         if heading is not None:
             self.heading = heading
 
+    def as_pos(self):
+        return np.array([self.x, self.z, self.y]).copy()
+
     def __key(self):
         return (self.x, self.y, self.z, self.heading)
 
@@ -141,6 +144,9 @@ class RRTStarUnicycle:
     def _euclid_2D(self, p1, p2):
         return np.sqrt( (p1.x-p2.x)**2 + (p1.y-p2.y)**2 )
 
+    def _is_navigable(self, pt, max_y_delta=0.5):
+        return self._pathfinder.is_navigable(pt.as_pos(), max_y_delta=max_y_delta)
+
     def _critical_angle(self, euclid_dist, theta=np.pi/2.):
         theta_pivot = 0
         best_path_time = float('inf')
@@ -188,7 +194,11 @@ class RRTStarUnicycle:
         # The difference between the robot's heading and the destination when it starts
         # moving in an arc
         theta_arc = min(critical_angle, theta)
-        arc_length = np.sqrt(2)*euclid_dist*theta_arc/np.sqrt(1-np.cos(2*theta_arc))
+
+        if np.sqrt(1-np.cos(2*theta_arc)) < 1e-6:
+            arc_length = euclid_dist
+        else:
+            arc_length = np.sqrt(2)*euclid_dist*theta_arc/np.sqrt(1-np.cos(2*theta_arc))
         arc_time = arc_length/self._max_linear_velocity
 
         delta_path_time = arc_time+pivot_time
@@ -286,19 +296,6 @@ class RRTStarUnicycle:
 
         return p_new, True
 
-    # def _closest_tree_pt(self, p):
-    #     min_dist = float('inf')
-    #     for tree_p in self.tree.keys():
-    #         euclid_dist = self._euclid_2D(p, tree_p)
-    #         if euclid_dist < min_dist:
-    #             closest_pt = p
-    #             min_dist = euclid_dist  
-
-    #     return closest_pt
-
-    # def _closest_tree_pt(self, p):
-    #     return min(self.tree.keys(), lambda x: self._euclid_2D(p, x))
-
     def _get_near_pts(self, pt):
         ret = []
         i = int((pt.x-self.x_min)//self._near_threshold)
@@ -351,32 +348,29 @@ class RRTStarUnicycle:
         return min(neighbors, key=lambda x: self._euclid_2D(pt, x))
 
     def _path_exists(self, a, b):
-        # c = self._pathfinder.try_step_no_sliding(a.point, b.point)
-        # return np.allclose(b.point, c)
         try:
-            intermediate_points = self.calculate_intermediate_points([a,b])
+            intermediate_points = self._get_intermediate_pts(a, b, resolution=0.05)
         except (ValueError, OverflowError):
             return False
 
-        # for pt, next_pt in zip(intermediate_points[:-1], intermediate_points[1:]):
-            # c = self._pathfinder.try_step_no_sliding(pt.point, next_pt.point)
-            # if not np.allclose(next_pt.point, c):
-            #     return False
-        for pt in intermediate_points[1:-1]:
-            if not self._pathfinder.is_navigable(pt.point):
+        for pt in intermediate_points:
+            if not self._is_navigable(pt):
                 return False
 
         return True
 
-    def calculate_intermediate_points(self, path, precision=2):
-        all_pts = [self._start]
+    def make_path_finer(self, path, precision=2, resolution=0.01):
+        all_pts = []
         for pt, new_pt in zip(path[:-1], path[1:]):
-            all_pts += self._get_intermediate_pts(pt, new_pt, precision=precision)
+            all_pts += self._get_intermediate_pts(pt, new_pt, precision=precision, resolution=resolution)
 
         return all_pts
 
-    def _get_intermediate_pts(self, pt, new_pt, precision=2):
-        self.vel_control.linear_velocity = np.array([0.0, 0.0, -self._max_linear_velocity])
+    def _get_intermediate_pts(self, pt, new_pt, precision=2, resolution=0.1):
+        '''
+        Only return the points between, if there is enough space.
+        '''
+
         # theta is the angle from pt to new_pt (0 rad is east)
         theta = math.atan2((new_pt.y-pt.y), new_pt.x-pt.x)
         # theta becomes the angle between the robot's heading at pt to new_pt
@@ -397,7 +391,10 @@ class RRTStarUnicycle:
         and the line connecting the start point with the end point is 2*theta_arc.
         '''
         theta_arc = min(critical_angle, theta)
-        arc_length = np.sqrt(2)*euclid_dist*theta_arc/np.sqrt(1-np.cos(2*theta_arc)) # trigonometry
+        if np.sqrt(1-np.cos(2*theta_arc)) < 1e-6:
+            arc_length = euclid_dist
+        else:
+            arc_length = np.sqrt(2)*euclid_dist*theta_arc/np.sqrt(1-np.cos(2*theta_arc))
         arc_time = arc_length/self._max_linear_velocity
         arc_angular_vel = theta_arc*2 / arc_time 
 
@@ -412,20 +409,28 @@ class RRTStarUnicycle:
         We are only interested in the arc_time, because the robot doesn't move
         when pivoting. Get the pivoting out of the way by simple addition.
         '''
-        pt_pos = pt.point
-        pt_pos = np.array([pt_pos[0], self._start.z+0.5, pt_pos[2]])
+        pt_pos = pt.as_pos()
         pt_quaternion = heading_to_quaternion(pt.heading+theta_pivot)
         rigid_state = habitat_sim.bindings.RigidState(pt_quaternion, pt_pos)
+        self.vel_control.linear_velocity = np.array([0.0, 0.0, -self._max_linear_velocity]) # Always go max linear
         self.vel_control.angular_velocity = np.array([0., arc_angular_vel, 0.])
         
-        num_points = int(round(arc_length/0.1)) # TODO: Make this adjustable. Right now, every 0.1m.
-        time_step = arc_time/float(num_points)
+        num_points = int(round(arc_length/resolution))
+        if num_points == 0:
+            return []
+
         all_pts = []
+        time_step = arc_time/float(num_points)
+        z_step = (new_pt.z-pt.z)/float(num_points)
         for i in range(num_points):
             rigid_state = self.vel_control.integrate_transform(
                 time_step, rigid_state
             )
-
+            rigid_state.translation = mn.Vector3(
+                rigid_state.translation[0],
+                rigid_state.translation[1]+z_step,
+                rigid_state.translation[2]
+            )
             end_heading = quat_to_rad(
                 np.quaternion(rigid_state.rotation.scalar, 
                 *rigid_state.rotation.vector)
@@ -507,23 +512,33 @@ class RRTStarUnicycle:
         for node, node_parent in self.tree.items():
             if node_parent is None: # Start point has no parent
                 continue
-            cv2.line(
-                top_down_img,
-                (self._scale_x(node.x),        self._scale_y(node.y)),
-                (self._scale_x(node_parent.x), self._scale_y(node_parent.y)),
-                (0,0,255),
-                1
-            )
-
-        # Draw best path to goal if it exists
-        if self._best_goal_node is not None:
-            fine_path = self.calculate_intermediate_points(self._get_best_path())
+            fine_path = [node_parent]+self._get_intermediate_pts(node_parent, node, resolution=0.01)+[node]
             for pt, next_pt in zip(fine_path[:-1], fine_path[1:]):
+                if self._is_navigable(pt) and self._is_navigable(next_pt):
+                    line_color = (0,0,255)
+                else:
+                    line_color = (0,255,255)
                 cv2.line(
                     top_down_img,
                     (self._scale_x(pt.x),       self._scale_y(pt.y)),
                     (self._scale_x(next_pt.x),  self._scale_y(next_pt.y)),
-                    (0,255,0),
+                    line_color,
+                    1
+                )
+
+        # Draw best path to goal if it exists
+        if self._best_goal_node is not None:
+            fine_path = self.make_path_finer(self._get_best_path())
+            for pt, next_pt in zip(fine_path[:-1], fine_path[1:]):
+                if self._is_navigable(pt) and self._is_navigable(next_pt):
+                    line_color = (0,255,0)
+                else:
+                    line_color = (0,0,255)
+                cv2.line(
+                    top_down_img,
+                    (self._scale_x(pt.x),       self._scale_y(pt.y)),
+                    (self._scale_x(next_pt.x),  self._scale_y(next_pt.y)),
+                    line_color,
                     3
                 )
 
@@ -542,8 +557,9 @@ class RRTStarUnicycle:
             (0,0,0),
             3
         )
-        mask = cv2.cvtColor(self._top_down_img, cv2.COLOR_BGR2GRAY)
-        top_down_img[mask==255] = (255,255,255)
+        # Draw walls again
+        # mask = cv2.cvtColor(self._top_down_img, cv2.COLOR_BGR2GRAY)
+        # top_down_img[mask==255] = (255,255,255)
 
         if show:
             cv2.imshow('top_down_img', top_down_img)
@@ -583,7 +599,7 @@ class RRTStarUnicycle:
 
         # Add the best path
         best_path = self._get_best_path()
-        fine_path = self.calculate_intermediate_points(best_path)
+        fine_path = self.make_path_finer(best_path)
         fine_path_str = [i._str_key() for i in fine_path]
         string_tree['best_path'] = fine_path_str
         string_tree['best_path_raw'] = [i._str_key() for i in best_path]
@@ -661,26 +677,25 @@ class RRTStarUnicycle:
                             continue
 
                         # Shorten distance
-                        closest_pt = self._closest_tree_pt(rand_pt) # TODO: Make this fast
+                        closest_pt = self._closest_tree_pt(rand_pt)
                         rand_pt, has_changed = self._max_point(closest_pt, rand_pt)
-                        if not has_changed or self._pathfinder.is_navigable(rand_pt.point):
+                        if not has_changed or self._is_navigable(rand_pt):
                             found_valid_new_node = True
                     else:
                         best_path = self._get_path_to_start(self._best_goal_node)
                         best_path_pt = random.choice(best_path)
-                        rand_r = self._max_distance * np.sqrt(np.random.rand())
+                        rand_r = 1.0 * np.sqrt(np.random.rand()) # TODO make this adjustable
                         rand_theta = np.random.rand() * 2 * np.pi
                         x = best_path_pt.x + rand_r * np.cos(rand_theta)
                         y = best_path_pt.y + rand_r * np.sin(rand_theta)
                         z = best_path_pt.z
                         rand_pt = PointHeading(self._pathfinder.snap_point([x, z, y])) # MAY RETURN NAN NAN NAN
-                        if self._pathfinder.is_navigable(rand_pt.point):
+                        if self._is_navigable(rand_pt):
                             found_valid_new_node = True
                 # time1 = time.time()
 
                 # Find valid neighbors
                 nearby_nodes = []
-                # for pt in self.tree.keys(): # TODO: Make this fast
                 for pt in self._get_near_pts(rand_pt):
                     if (
                         self._euclid_2D(rand_pt, pt) < self._near_threshold # within distance
@@ -695,7 +710,6 @@ class RRTStarUnicycle:
                 # Find best parent from valid neighbors        
                 min_cost = float('inf')
                 for idx, pt in enumerate(nearby_nodes):
-                    # new_cost, final_heading = self._cost(pt, new_pt=rand_pt)
                     cost_from_parent, final_heading = self._cost_from_to(pt, rand_pt, return_heading=True)
                     new_cost = self._cost_from_start(pt) + cost_from_parent
                     if new_cost < min_cost:
@@ -721,7 +735,6 @@ class RRTStarUnicycle:
                     self._euclid_2D(rand_pt, goal_pt) < self._goal_minimum_distance
                     and (
                         self._best_goal_node is None
-                        # or self._cost(rand_pt, new_pt=self._goal)[0] < self._cost(self._best_goal_node, new_pt=self._goal)[0]
                         or self._cost_from_start(rand_pt)+self._cost_from_to(rand_pt, self._goal) < self._cost_from_start(self._best_goal_node)+self._cost_from_to(self._best_goal_node, self._goal)
                     )
                 ):
@@ -732,10 +745,9 @@ class RRTStarUnicycle:
                 for pt in nearby_nodes:
                     if pt == start_pt:
                         continue
-                    # new_cost = self._cost(rand_pt, new_pt=pt)[0]
                     cost_from_new_pt = self._cost_from_to(rand_pt, pt)
                     new_cost = self._cost_from_start(rand_pt)+cost_from_new_pt
-                    if new_cost < self._cost_from_start(pt):
+                    if new_cost < self._cost_from_start(pt) and self._path_exists(rand_pt, pt):
                         self.tree[pt] = rand_pt
                         self._cost_from_parent[pt] = cost_from_new_pt
 
@@ -759,7 +771,7 @@ class RRTStarUnicycle:
                 success = True
 
     def generate_topdown_img(self, meters_per_pixel=0.01):
-        y = self._start.point[1]
+        y = self._start.as_pos()[1]
         topdown = self._pathfinder.get_topdown_view(meters_per_pixel, y)
         topdown_bgr = np.zeros((*topdown.shape, 3), dtype=np.uint8)
         topdown_bgr[topdown==0] = (255,255,255)
