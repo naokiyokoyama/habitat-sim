@@ -9,9 +9,11 @@ import os
 import quaternion
 import glob
 import magnum as mn
-import habitat_sim
 import random
 from collections import defaultdict
+
+import habitat_sim
+from habitat_sim.nav import ShortestPath
 
 def get_episode_info(episode_id, json_gz_path):
     with gzip.open(json_gz_path,'r') as f:
@@ -129,6 +131,7 @@ class RRTStarUnicycle:
 
         # TODO: Search the tree with binary search
         self.tree = {}
+        self.grid_hash = defaultdict(list)
         self._best_goal_node = None
         self._top_down_img = None
         self.vel_control = habitat_sim.physics.VelocityControl()
@@ -140,6 +143,7 @@ class RRTStarUnicycle:
         self._start = None
         self._goal = None
         self._cost_from_parent = {}
+        self.x_min, self.x_max, self.y_min, self.y_max = None, None, None, None
 
     def _euclid_2D(self, p1, p2):
         return np.sqrt( (p1.x-p2.x)**2 + (p1.y-p2.y)**2 )
@@ -253,7 +257,13 @@ class RRTStarUnicycle:
 
         return total_cost, final_heading
 
-    def _cost_from_to(self, pt, new_pt, return_heading=False):
+    def _cost_from_to(
+        self, 
+        pt, 
+        new_pt, 
+        return_heading=False,
+        consider_end_heading=False
+    ):
         # theta is the angle from pt to new_pt (0 rad is east)
         theta = math.atan2((new_pt.y-pt.y), new_pt.x-pt.x)
         # theta_diff is angle between the robot's heading at pt to new_pt
@@ -262,7 +272,7 @@ class RRTStarUnicycle:
 
         delta_heading, delta_path_time = self._fastest_delta_heading_time(abs(theta_diff), euclid_dist)
 
-        if return_heading:
+        if return_heading or consider_end_heading:
             if theta_diff < 0:
                 final_heading = pt.heading-delta_heading
             else:
@@ -271,7 +281,10 @@ class RRTStarUnicycle:
                 final_heading -= np.pi*2
             elif final_heading < -np.pi:
                 final_heading += np.pi*2
-            return delta_path_time, final_heading
+            if consider_end_heading:
+                delta_path_time += abs(self._get_heading_error(new_pt.heading, final_heading)/self._max_angular_velocity)
+            if return_heading:
+                return delta_path_time, final_heading
 
         return delta_path_time
 
@@ -280,7 +293,11 @@ class RRTStarUnicycle:
         cost = 0
         for parent, child in zip(path[:-1], path[1:]):
             if child not in self._cost_from_parent:
-                self._cost_from_parent[child] = self._cost_from_to(parent, child)
+                self._cost_from_parent[child] = self._cost_from_to(
+                    parent,
+                    child,
+                    consider_end_heading=True
+                )
             cost += self._cost_from_parent[child]
         return cost
 
@@ -469,6 +486,9 @@ class RRTStarUnicycle:
         if self._goal is None:
             self._goal = self._str_to_pt(goal_str)
 
+        if self.x_min is None:
+            self._set_offsets()
+
         for k,v in latest_string_tree['graph'].items():
             pt = self._str_to_pt(k)
             if k == latest_string_tree['best_goal_node']:
@@ -483,13 +503,17 @@ class RRTStarUnicycle:
                 pt_v = self._str_to_pt(v)
                 self.tree[pt] = pt_v
                 self.add_to_grid_hash(pt)
-
         
         self._start_iteration = int(os.path.basename(json_path).split('_')[0]) + 1
 
         return None
 
-    def _visualize_tree(self, meters_per_pixel=0.01, show=False, save_path=None):
+    def _visualize_tree(
+        self,
+        meters_per_pixel=0.01,
+        show=False,
+        save_path=None
+    ):
         '''
         Save and/or visualize the current tree and the best path found so far
         '''
@@ -508,21 +532,17 @@ class RRTStarUnicycle:
 
         top_down_img = self._top_down_img.copy()
 
-        # Draw entire graph in red
+        # Draw all edges in orange
         for node, node_parent in self.tree.items():
             if node_parent is None: # Start point has no parent
                 continue
             fine_path = [node_parent]+self._get_intermediate_pts(node_parent, node, resolution=0.01)+[node]
             for pt, next_pt in zip(fine_path[:-1], fine_path[1:]):
-                if self._is_navigable(pt) and self._is_navigable(next_pt):
-                    line_color = (0,0,255)
-                else:
-                    line_color = (0,255,255)
                 cv2.line(
                     top_down_img,
                     (self._scale_x(pt.x),       self._scale_y(pt.y)),
                     (self._scale_x(next_pt.x),  self._scale_y(next_pt.y)),
-                    line_color,
+                    (0,102,255),
                     1
                 )
 
@@ -530,24 +550,23 @@ class RRTStarUnicycle:
         if self._best_goal_node is not None:
             fine_path = self.make_path_finer(self._get_best_path())
             for pt, next_pt in zip(fine_path[:-1], fine_path[1:]):
-                if self._is_navigable(pt) and self._is_navigable(next_pt):
-                    line_color = (0,255,0)
-                else:
-                    line_color = (0,0,255)
                 cv2.line(
                     top_down_img,
                     (self._scale_x(pt.x),       self._scale_y(pt.y)),
                     (self._scale_x(next_pt.x),  self._scale_y(next_pt.y)),
-                    line_color,
+                    (0,255,0),
                     3
                 )
 
-        # Draw start and goal points
+        # Draw start point+heading in blue
         start_x, start_y = self._scale_x(self._start.x),  self._scale_y(self._start.y)
-        cv2.circle(top_down_img, (start_x, start_y), 8, (255,0,0),   -1)
-        cv2.circle(top_down_img, (self._scale_x(self._goal.x),  self._scale_y(self._goal.y)),  8, (0,255,255), -1)
-
-        # Draw start heading
+        cv2.circle(
+            top_down_img,
+            (start_x, start_y),
+            8,
+            (255,192,15),
+            -1
+        )
         LINE_SIZE = 10
         heading_end_pt = (int(start_x+LINE_SIZE*np.cos(self._start.heading)), int(start_y+LINE_SIZE*np.sin(self._start.heading)))
         cv2.line(
@@ -557,9 +576,27 @@ class RRTStarUnicycle:
             (0,0,0),
             3
         )
-        # Draw walls again
-        # mask = cv2.cvtColor(self._top_down_img, cv2.COLOR_BGR2GRAY)
-        # top_down_img[mask==255] = (255,255,255)
+
+        # Draw goal point in red
+        # cv2.circle(top_down_img, (self._scale_x(self._goal.x),  self._scale_y(self._goal.y)),  8, (0,255,255), -1)
+        SQUARE_SIZE = 6
+        cv2.rectangle(
+            top_down_img,
+            (self._scale_x(self._goal.x)-SQUARE_SIZE,  self._scale_y(self._goal.y)-SQUARE_SIZE),
+            (self._scale_x(self._goal.x)+SQUARE_SIZE,  self._scale_y(self._goal.y)+SQUARE_SIZE),
+            (0, 0, 255),
+            -1
+        ) 
+
+        # Draw shortest waypoints
+        for i in self._shortest_path_points:
+            cv2.circle(
+                top_down_img,
+                (self._scale_x(i.x), self._scale_y(i.y)),
+                3,
+                (255,192,15),
+                -1
+            )
 
         if show:
             cv2.imshow('top_down_img', top_down_img)
@@ -567,6 +604,8 @@ class RRTStarUnicycle:
 
         if save_path is not None:
             cv2.imwrite(save_path, top_down_img)
+
+        return top_down_img
 
     def _get_best_path(self):
         if self._best_goal_node is None:
@@ -613,25 +652,7 @@ class RRTStarUnicycle:
         j = int((pt.y-self.y_min)//self._near_threshold)
         self.grid_hash[(i,j)].append(pt)
 
-    def generate_tree(
-        self,
-        start_position,
-        start_heading,
-        goal_position,
-        json_path=None,
-        iterations=5e4,
-        visualize_on_screen=False,
-        visualize_iterations=500
-    ):
-        start_pt = PointHeading(start_position, heading=start_heading)
-        goal_pt  = PointHeading(goal_position)
-        self.tree[start_pt] = None
-        self._cost_from_parent[start_pt] = 0
-        self._start = start_pt
-        self._goal = goal_pt
-        self.grid_hash = defaultdict(list)
-        # self.times = defaultdict(list)
-
+    def _set_offsets(self):
         self.x_min, self.y_min = float('inf'), float('inf')
         self.x_max, self.y_max = float('-inf'), float('-inf')
         for v in self._pathfinder.build_navmesh_vertices():
@@ -642,6 +663,35 @@ class RRTStarUnicycle:
                 self.y_min = min(self.y_min, pt.y)
                 self.x_max = max(self.x_max, pt.x)
                 self.y_max = max(self.y_max, pt.y)
+
+    def _get_shortest_path_points(self):
+        sp = ShortestPath()
+        sp.requested_start = self._start.as_pos()
+        sp.requested_end   = self._goal.as_pos()
+        self._pathfinder.find_path(sp)
+        self._shortest_path_points = [PointHeading(i) for i in sp.points]
+
+    def generate_tree(
+        self,
+        start_position,
+        start_heading,
+        goal_position,
+        json_path=None,
+        iterations=5e4,
+        visualize_on_screen=False,
+        visualize_iterations=500
+    ):
+        np.random.seed(0)
+        random.seed(0)
+        self._start = PointHeading(start_position, heading=start_heading)
+        self._goal  = PointHeading(goal_position)
+        self.tree[self._start] = None
+        self._cost_from_parent[self._start] = 0
+        # self.times = defaultdict(list)
+
+        self._get_shortest_path_points()
+
+        self._set_offsets()
                 
         self.add_to_grid_hash(self._start)
         self._load_tree_from_json(json_path=json_path)
@@ -653,22 +703,13 @@ class RRTStarUnicycle:
 
             success = False
             while not success:
-                # Visualize and save tree to disk
-                if iteration > 0 and iteration % visualize_iterations == 0 and self._directory != '':
-                    img_path  = os.path.join(self._vis_dir,  '{}_{}.png'.format( iteration, os.path.basename(self._vis_dir)))
-                    json_path = os.path.join(self._json_dir, '{}_{}.json'.format(iteration, os.path.basename(self._json_dir)))
-                    self._visualize_tree(save_path=img_path, show=visualize_on_screen)
-                    string_tree = self._string_tree()
-                    with open(json_path, 'w') as f:
-                        json.dump(string_tree, f)
-
                 # time0 = time.time()
                 '''
                 Choose random NAVIGABLE point.
                 If a path to the goal is already found, with 80% chance, we sample near that path.
                 20% chance, explore elsewhere.
                 '''
-                sample_random = self._best_goal_node is None or np.random.rand() < 0.2
+                sample_random = np.random.rand() < 0.2
                 found_valid_new_node = False
                 while not found_valid_new_node:
                     if sample_random:
@@ -682,9 +723,14 @@ class RRTStarUnicycle:
                         if not has_changed or self._is_navigable(rand_pt):
                             found_valid_new_node = True
                     else:
-                        best_path = self._get_path_to_start(self._best_goal_node)
-                        best_path_pt = random.choice(best_path)
-                        rand_r = 1.0 * np.sqrt(np.random.rand()) # TODO make this adjustable
+                        if self._best_goal_node is None:
+                            # sample_random = True; continue
+                            best_path_pt = random.choice(self._shortest_path_points)
+                        else:
+                            best_path = self._get_path_to_start(self._best_goal_node)
+                            best_path_pt = random.choice(best_path)
+
+                        rand_r = 1.5 * np.sqrt(np.random.rand()) # TODO make this adjustable
                         rand_theta = np.random.rand() * 2 * np.pi
                         x = best_path_pt.x + rand_r * np.cos(rand_theta)
                         y = best_path_pt.y + rand_r * np.sin(rand_theta)
@@ -731,26 +777,47 @@ class RRTStarUnicycle:
                 except IndexError:
                     continue
 
-                if (
-                    self._euclid_2D(rand_pt, goal_pt) < self._goal_minimum_distance
-                    and (
-                        self._best_goal_node is None
-                        or self._cost_from_start(rand_pt)+self._cost_from_to(rand_pt, self._goal) < self._cost_from_start(self._best_goal_node)+self._cost_from_to(self._best_goal_node, self._goal)
-                    )
-                ):
-                    self._best_goal_node = rand_pt
-                # time4 = time.time()
-
                 # Rewire
                 for pt in nearby_nodes:
-                    if pt == start_pt:
+                    if pt == self._start:
                         continue
-                    cost_from_new_pt = self._cost_from_to(rand_pt, pt)
+                    cost_from_new_pt = self._cost_from_to(
+                        rand_pt,
+                        pt, 
+                        consider_end_heading=True
+                    )
                     new_cost = self._cost_from_start(rand_pt)+cost_from_new_pt
                     if new_cost < self._cost_from_start(pt) and self._path_exists(rand_pt, pt):
                         self.tree[pt] = rand_pt
                         self._cost_from_parent[pt] = cost_from_new_pt
 
+                # Update best path every so often
+                if iteration % 50 == 0 or iteration % visualize_iterations == 0 :
+                    min_costs = []
+                    for pt in self._get_near_pts(self._goal):
+                        if (
+                            self._euclid_2D(pt, self._goal) < self._near_threshold
+                            and self._path_exists(pt, self._goal)
+                        ):
+                            min_costs.append((
+                                self._cost_from_start(pt)+self._cost_from_to(pt, self._goal),
+                                pt
+                            ))
+                    if len(min_costs) > 0:
+                        self._best_goal_node = min(min_costs)[1]
+
+                # Save tree and visualization to disk
+                if (
+                    iteration > 0 
+                    and iteration % visualize_iterations == 0 
+                    and self._directory is not None
+                ):
+                    img_path  = os.path.join(self._vis_dir,  '{}_{}.png'.format( iteration, os.path.basename(self._vis_dir)))
+                    json_path = os.path.join(self._json_dir, '{}_{}.json'.format(iteration, os.path.basename(self._json_dir)))
+                    self._visualize_tree(save_path=img_path, show=visualize_on_screen)
+                    string_tree = self._string_tree()
+                    with open(json_path, 'w') as f:
+                        json.dump(string_tree, f)
                 # self.times['time0'].append(time0)
                 # self.times['time1'].append(time1)
                 # self.times['time2'].append(time2)
