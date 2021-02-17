@@ -834,17 +834,18 @@ class RRTStarUnicycle:
                 # Update best path every so often
                 if iteration % 50 == 0 or iteration % visualize_iterations == 0 :
                     min_costs = []
-                    for pt in self._get_near_pts(self._goal):
+                    for idx, pt in enumerate(self._get_near_pts(self._goal)):
                         if (
                             self._euclid_2D(pt, self._goal) < self._near_threshold
                             and self._path_exists(pt, self._goal)
                         ):
                             min_costs.append((
                                 self._cost_from_start(pt)+self._cost_from_to(pt, self._goal),
+                                idx, # Tie-breaker for previous line when min is used
                                 pt
                             ))
                     if len(min_costs) > 0:
-                        self._best_goal_node = min(min_costs)[1]
+                        self._best_goal_node = min(min_costs)[2]
 
                 # Save tree and visualization to disk
                 if (
