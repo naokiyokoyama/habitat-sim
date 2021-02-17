@@ -143,6 +143,7 @@ class RRTStarUnicycle:
         self._start = None
         self._goal = None
         self._cost_from_parent = {}
+        self._shortest_path_points = None
         self.x_min, self.x_max, self.y_min, self.y_max = None, None, None, None
 
     def _euclid_2D(self, p1, p2):
@@ -512,6 +513,8 @@ class RRTStarUnicycle:
         self,
         meters_per_pixel=0.01,
         show=False,
+        path=None, # Option to visualize another path
+        draw_all_edges=True,
         save_path=None
     ):
         '''
@@ -533,22 +536,26 @@ class RRTStarUnicycle:
         top_down_img = self._top_down_img.copy()
 
         # Draw all edges in orange
-        for node, node_parent in self.tree.items():
-            if node_parent is None: # Start point has no parent
-                continue
-            fine_path = [node_parent]+self._get_intermediate_pts(node_parent, node, resolution=0.01)+[node]
-            for pt, next_pt in zip(fine_path[:-1], fine_path[1:]):
-                cv2.line(
-                    top_down_img,
-                    (self._scale_x(pt.x),       self._scale_y(pt.y)),
-                    (self._scale_x(next_pt.x),  self._scale_y(next_pt.y)),
-                    (0,102,255),
-                    1
-                )
+        if draw_all_edges:
+            for node, node_parent in self.tree.items():
+                if node_parent is None: # Start point has no parent
+                    continue
+                fine_path = [node_parent]+self._get_intermediate_pts(node_parent, node, resolution=0.01)+[node]
+                for pt, next_pt in zip(fine_path[:-1], fine_path[1:]):
+                    cv2.line(
+                        top_down_img,
+                        (self._scale_x(pt.x),       self._scale_y(pt.y)),
+                        (self._scale_x(next_pt.x),  self._scale_y(next_pt.y)),
+                        (0,102,255),
+                        1
+                    )
 
         # Draw best path to goal if it exists
-        if self._best_goal_node is not None:
-            fine_path = self.make_path_finer(self._get_best_path())
+        if path is not None or self._best_goal_node is not None:
+            if path is not None:
+                fine_path = self.make_path_finer(path)
+            else:
+                fine_path = self.make_path_finer(self._get_best_path())
             for pt, next_pt in zip(fine_path[:-1], fine_path[1:]):
                 cv2.line(
                     top_down_img,
@@ -589,6 +596,8 @@ class RRTStarUnicycle:
         ) 
 
         # Draw shortest waypoints
+        if self._shortest_path_points is None:
+            self._get_shortest_path_points()
         for i in self._shortest_path_points:
             cv2.circle(
                 top_down_img,
@@ -596,6 +605,27 @@ class RRTStarUnicycle:
                 3,
                 (255,192,15),
                 -1
+            )
+
+        # Draw fastest waypoints
+        if path is None:
+            path = self._get_best_path()[1:-1]
+        for i in path:
+            cv2.circle(
+                top_down_img,
+                (self._scale_x(i.x), self._scale_y(i.y)),
+                3,
+                (0,0,255),
+                -1
+            )
+            LINE_SIZE = 8
+            heading_end_pt = (int(self._scale_x(i.x)+LINE_SIZE*np.cos(i.heading)), int(self._scale_y(i.y)+LINE_SIZE*np.sin(i.heading)))
+            cv2.line(
+                top_down_img,
+                (self._scale_x(i.x), self._scale_y(i.y)),
+                heading_end_pt,
+                (0,0,0),
+                1
             )
 
         if show:
@@ -679,10 +709,11 @@ class RRTStarUnicycle:
         json_path=None,
         iterations=5e4,
         visualize_on_screen=False,
-        visualize_iterations=500
+        visualize_iterations=500,
+        seed=0
     ):
-        np.random.seed(0)
-        random.seed(0)
+        np.random.seed(seed)
+        random.seed(seed)
         self._start = PointHeading(start_position, heading=start_heading)
         self._goal  = PointHeading(goal_position)
         self.tree[self._start] = None
@@ -736,7 +767,16 @@ class RRTStarUnicycle:
                         y = best_path_pt.y + rand_r * np.sin(rand_theta)
                         z = best_path_pt.z
                         rand_pt = PointHeading(self._pathfinder.snap_point([x, z, y])) # MAY RETURN NAN NAN NAN
-                        if self._is_navigable(rand_pt):
+
+                        if not self._is_navigable(rand_pt):
+                            continue
+
+                        if self._best_goal_node is None:
+                            closest_pt = self._closest_tree_pt(rand_pt)
+                            rand_pt, has_changed = self._max_point(closest_pt, rand_pt)
+                            if not has_changed or self._is_navigable(rand_pt):
+                                found_valid_new_node = True
+                        else:
                             found_valid_new_node = True
                 # time1 = time.time()
 
