@@ -226,38 +226,6 @@ class RRTStarUnicycle:
             pt = self.tree[pt]
         return path
 
-    def _cost(self, pt, new_pt=None):
-        if new_pt is None and pt == self._start:
-            return 0
-
-        path = self._get_path_to_start(pt)
-        if new_pt is not None:
-            path.append(new_pt)
-
-        total_cost = 0
-        pt = path[0]
-        for new_pt in path[1:]:
-            # theta is the angle from pt to new_pt (0 rad is east)
-            theta = math.atan2((new_pt.y-pt.y), new_pt.x-pt.x)
-            # theta_diff is angle between the robot's heading at pt to new_pt
-            theta_diff = self._get_heading_error(pt.heading, theta)
-            euclid_dist = self._euclid_2D(pt, new_pt)
-
-            delta_heading, delta_path_time = self._fastest_delta_heading_time(abs(theta_diff), euclid_dist)
-            if theta_diff < 0:
-                final_heading = pt.heading-delta_heading
-            else:
-                final_heading = pt.heading+delta_heading
-            if final_heading > np.pi:
-                final_heading -= np.pi*2
-            elif final_heading < -np.pi:
-                final_heading += np.pi*2
-
-            total_cost += delta_path_time
-            pt = new_pt
-
-        return total_cost, final_heading
-
     def _cost_from_to(
         self, 
         pt, 
